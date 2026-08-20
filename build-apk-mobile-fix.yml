@@ -1,0 +1,105 @@
+name: Build Venas Hizli Giris APK
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Kaynak kodu al
+        uses: actions/checkout@v4
+
+      - name: Java 17 kur
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Android SDK kur
+        uses: android-actions/setup-android@v3
+
+      - name: Android 36 paketlerini kur
+        run: sdkmanager "platforms;android-36" "build-tools;35.0.0"
+
+      - name: Telefonda duz yuklenen dosyalardan Android klasor yapisini olustur
+        shell: bash
+        run: |
+          set -e
+          required=(AndroidManifest.xml MainActivity.java OtpNotificationListener.java OtpParser.java OtpStore.java ServerStatusClient.java strings.xml styles.xml venas_logo.png proguard-rules.pro)
+          for f in "${required[@]}"; do
+            if [ ! -f "$f" ]; then
+              echo "EKSIK DOSYA: $f"
+              exit 1
+            fi
+          done
+
+          mkdir -p app/src/main/java/com/venas/hizligiris
+          mkdir -p app/src/main/res/values
+          mkdir -p app/src/main/res/drawable
+
+          cp AndroidManifest.xml app/src/main/AndroidManifest.xml
+          cp MainActivity.java app/src/main/java/com/venas/hizligiris/MainActivity.java
+          cp OtpNotificationListener.java app/src/main/java/com/venas/hizligiris/OtpNotificationListener.java
+          cp OtpParser.java app/src/main/java/com/venas/hizligiris/OtpParser.java
+          cp OtpStore.java app/src/main/java/com/venas/hizligiris/OtpStore.java
+          cp ServerStatusClient.java app/src/main/java/com/venas/hizligiris/ServerStatusClient.java
+          cp strings.xml app/src/main/res/values/strings.xml
+          cp styles.xml app/src/main/res/values/styles.xml
+          cp venas_logo.png app/src/main/res/drawable/venas_logo.png
+          cp proguard-rules.pro app/proguard-rules.pro
+
+          cat > app/build.gradle <<'GRADLE'
+          plugins {
+              id 'com.android.application'
+          }
+
+          android {
+              namespace 'com.venas.hizligiris'
+              compileSdk 36
+
+              defaultConfig {
+                  applicationId 'com.venas.hizligiris.safe'
+                  minSdk 26
+                  targetSdk 35
+                  versionCode 11
+                  versionName '1.1.0'
+              }
+
+              buildTypes {
+                  release {
+                      minifyEnabled false
+                      proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+                  }
+              }
+
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+          }
+          GRADLE
+
+      - name: Gradle 8.13 kur
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.13'
+
+      - name: APK derle
+        run: gradle :app:assembleDebug --stacktrace
+
+      - name: APK adini duzelt
+        run: cp app/build/outputs/apk/debug/app-debug.apk VenasHizliGiris-v1.1.0.apk
+
+      - name: APK'yi artifact olarak yukle
+        uses: actions/upload-artifact@v4
+        with:
+          name: VenasHizliGiris-v1.1.0-APK
+          path: VenasHizliGiris-v1.1.0.apk
+          if-no-files-found: error
