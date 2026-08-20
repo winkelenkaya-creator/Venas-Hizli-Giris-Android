@@ -1,4 +1,4 @@
-name: Build Venas Hizli Giris APK v1.1.2
+name: Build Venas Hizli Giris APK v1.1.3
 
 on:
   push:
@@ -28,11 +28,11 @@ jobs:
       - name: Android paketlerini kur
         run: sdkmanager "platforms;android-36" "build-tools;35.0.0"
 
-      - name: Android proje yapisini olustur ve bildirim algilamayi guclendir
+      - name: Android proje yapisini olustur
         shell: bash
         run: |
           set -e
-          required=(AndroidManifest.xml MainActivity.java OtpStore.java ServerStatusClient.java strings.xml styles.xml venas_logo.png proguard-rules.pro)
+          required=(ServerStatusClient.java strings.xml styles.xml venas_logo.png proguard-rules.pro)
           for f in "${required[@]}"; do
             if [ ! -f "$f" ]; then
               echo "EKSIK DOSYA: $f"
@@ -44,14 +44,56 @@ jobs:
           mkdir -p app/src/main/res/values
           mkdir -p app/src/main/res/drawable
 
-          cp AndroidManifest.xml app/src/main/AndroidManifest.xml
-          cp MainActivity.java app/src/main/java/com/venas/hizligiris/MainActivity.java
-          cp OtpStore.java app/src/main/java/com/venas/hizligiris/OtpStore.java
           cp ServerStatusClient.java app/src/main/java/com/venas/hizligiris/ServerStatusClient.java
           cp strings.xml app/src/main/res/values/strings.xml
           cp styles.xml app/src/main/res/values/styles.xml
           cp venas_logo.png app/src/main/res/drawable/venas_logo.png
           cp proguard-rules.pro app/proguard-rules.pro
+
+          cat > app/src/main/AndroidManifest.xml <<'XML'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.RECEIVE_SMS" />
+              <uses-feature android:name="android.hardware.telephony" android:required="false" />
+
+              <application
+                  android:allowBackup="false"
+                  android:icon="@drawable/venas_logo"
+                  android:label="Venas Hızlı Giriş"
+                  android:supportsRtl="true"
+                  android:theme="@style/AppTheme"
+                  android:usesCleartextTraffic="false">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".OtpNotificationListener"
+                      android:exported="true"
+                      android:label="Venas Hızlı Giriş"
+                      android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.service.notification.NotificationListenerService" />
+                      </intent-filter>
+                  </service>
+
+                  <receiver
+                      android:name=".SmsReceiver"
+                      android:exported="true">
+                      <intent-filter android:priority="999">
+                          <action android:name="android.provider.Telephony.SMS_RECEIVED" />
+                      </intent-filter>
+                  </receiver>
+              </application>
+          </manifest>
+          XML
 
           cat > app/src/main/java/com/venas/hizligiris/OtpParser.java <<'JAVA'
           package com.venas.hizligiris;
@@ -67,6 +109,15 @@ jobs:
               private static final Pattern REF_PATTERN = Pattern.compile(
                       "(?i)referans\\s*[:\\-]?\\s*([A-Z0-9]{4,12}(?:\\s+B\\d{3})?)");
 
+              static boolean looksLikeContext(String text) {
+                  if (text == null) return false;
+                  String c = canonicalize(text);
+                  return c.contains("hizli giris")
+                          || c.contains("isturkcell")
+                          || c.contains("is turkcell")
+                          || (c.contains("sifreniz") && c.contains("giris"));
+              }
+
               static Result parse(String text) {
                   if (text == null || text.trim().isEmpty()) return null;
 
@@ -80,22 +131,18 @@ jobs:
                           .replace('\t', ' ');
 
                   String canonical = canonicalize(clean);
+                  if (!looksLikeContext(clean)) return null;
 
-                  int phraseIndex = canonical.indexOf("hizli giris sifreniz");
                   String otp = null;
-
-                  if (phraseIndex >= 0) {
-                      String after = canonical.substring(phraseIndex + "hizli giris sifreniz".length());
-                      Matcher m = SIX_DIGIT.matcher(after);
-                      if (m.find() && m.start() <= 40) otp = m.group(1);
+                  int marker = canonical.indexOf("sifreniz");
+                  if (marker >= 0) {
+                      Matcher near = SIX_DIGIT.matcher(canonical.substring(marker));
+                      if (near.find() && near.start() <= 80) otp = near.group(1);
                   }
 
-                  if (otp == null && canonical.contains("hizli giris") && canonical.contains("sifreniz")) {
-                      int idx = canonical.indexOf("sifreniz");
-                      if (idx >= 0) {
-                          Matcher m = SIX_DIGIT.matcher(canonical.substring(idx));
-                          if (m.find() && m.start() <= 60) otp = m.group(1);
-                      }
+                  if (otp == null) {
+                      Matcher any = SIX_DIGIT.matcher(canonical);
+                      if (any.find()) otp = any.group(1);
                   }
 
                   if (otp == null) return null;
@@ -107,12 +154,6 @@ jobs:
                   }
 
                   return new Result(otp, reference);
-              }
-
-              static boolean looksLikeFastLogin(String text) {
-                  if (text == null) return false;
-                  String c = canonicalize(text);
-                  return c.contains("hizli giris") || c.contains("sifreniz") || c.contains("isturkcell");
               }
 
               private static String canonicalize(String s) {
@@ -139,6 +180,78 @@ jobs:
           }
           JAVA
 
+          cat > app/src/main/java/com/venas/hizligiris/OtpStore.java <<'JAVA'
+          package com.venas.hizligiris;
+
+          import android.content.Context;
+          import android.content.SharedPreferences;
+
+          final class OtpStore {
+              private OtpStore() {}
+
+              private static final String PREF = "venas_hizli_giris";
+              private static final long TTL_MS = 180_000L;
+
+              static void save(Context context, String otp, String reference, long timestamp, String source) {
+                  prefs(context).edit()
+                          .putString("otp", otp == null ? "" : otp)
+                          .putString("reference", reference == null ? "" : reference)
+                          .putString("source", source == null ? "" : source)
+                          .putLong("timestamp", timestamp)
+                          .putString("last_event", (source == null ? "" : source) + ": 6 haneli kod yakalandı")
+                          .putLong("last_event_ts", timestamp)
+                          .apply();
+              }
+
+              static void note(Context context, String note) {
+                  prefs(context).edit()
+                          .putString("last_event", note == null ? "" : note)
+                          .putLong("last_event_ts", System.currentTimeMillis())
+                          .apply();
+              }
+
+              static Entry current(Context context) {
+                  SharedPreferences p = prefs(context);
+                  String otp = p.getString("otp", "");
+                  String ref = p.getString("reference", "");
+                  String source = p.getString("source", "");
+                  long ts = p.getLong("timestamp", 0L);
+                  if (otp == null || otp.length() != 6 || ts <= 0L) return null;
+                  if (System.currentTimeMillis() - ts > TTL_MS) {
+                      p.edit().remove("otp").remove("reference").remove("source").remove("timestamp").apply();
+                      return null;
+                  }
+                  return new Entry(otp, ref == null ? "" : ref, source == null ? "" : source, ts);
+              }
+
+              static String lastEvent(Context context) {
+                  return prefs(context).getString("last_event", "Henüz İş Turkcell mesajı algılanmadı");
+              }
+
+              static long lastEventTime(Context context) {
+                  return prefs(context).getLong("last_event_ts", 0L);
+              }
+
+              private static SharedPreferences prefs(Context context) {
+                  return context.getSharedPreferences(PREF, Context.MODE_PRIVATE);
+              }
+
+              static final class Entry {
+                  final String otp;
+                  final String reference;
+                  final String source;
+                  final long timestamp;
+
+                  Entry(String otp, String reference, String source, long timestamp) {
+                      this.otp = otp;
+                      this.reference = reference;
+                      this.source = source;
+                      this.timestamp = timestamp;
+                  }
+              }
+          }
+          JAVA
+
           cat > app/src/main/java/com/venas/hizligiris/OtpNotificationListener.java <<'JAVA'
           package com.venas.hizligiris;
 
@@ -149,22 +262,44 @@ jobs:
           import android.service.notification.NotificationListenerService;
           import android.service.notification.StatusBarNotification;
 
+          import java.util.ArrayList;
+
           public class OtpNotificationListener extends NotificationListenerService {
               private String lastFingerprint = "";
               private long lastFingerprintAt = 0L;
 
               @Override
+              public void onListenerConnected() {
+                  super.onListenerConnected();
+                  try {
+                      StatusBarNotification[] active = getActiveNotifications();
+                      if (active != null) {
+                          for (StatusBarNotification sbn : active) process(sbn);
+                      }
+                  } catch (Exception ignored) {}
+              }
+
+              @Override
               public void onNotificationPosted(StatusBarNotification sbn) {
+                  process(sbn);
+              }
+
+              private void process(StatusBarNotification sbn) {
                   if (sbn == null || sbn.getNotification() == null) return;
                   if (getPackageName().equals(sbn.getPackageName())) return;
 
-                  Notification n = sbn.getNotification();
-                  Bundle extras = n.extras;
+                  Bundle extras = sbn.getNotification().extras;
                   if (extras == null) return;
 
                   String combined = collectAllText(extras);
                   OtpParser.Result result = OtpParser.parse(combined);
-                  if (result == null) return;
+
+                  if (result == null) {
+                      if (OtpParser.looksLikeContext(combined)) {
+                          OtpStore.note(this, "Bildirim geldi; İş Turkcell metni görüldü ama 6 haneli kod bulunamadı");
+                      }
+                      return;
+                  }
 
                   long now = System.currentTimeMillis();
                   String fingerprint = result.otp + "|" + result.reference;
@@ -172,7 +307,7 @@ jobs:
 
                   lastFingerprint = fingerprint;
                   lastFingerprintAt = now;
-                  OtpStore.save(this, result.otp, result.reference, now);
+                  OtpStore.save(this, result.otp, result.reference, now, "Bildirim");
               }
 
               @Override
@@ -185,9 +320,7 @@ jobs:
 
               private static String collectAllText(Bundle extras) {
                   StringBuilder out = new StringBuilder();
-
                   append(out, extras.getCharSequence(Notification.EXTRA_TITLE));
-                  append(out, extras.getCharSequence(Notification.EXTRA_TITLE_BIG));
                   append(out, extras.getCharSequence(Notification.EXTRA_TEXT));
                   append(out, extras.getCharSequence(Notification.EXTRA_BIG_TEXT));
                   append(out, extras.getCharSequence(Notification.EXTRA_SUB_TEXT));
@@ -199,37 +332,35 @@ jobs:
                       for (CharSequence line : lines) append(out, line);
                   }
 
-                  appendMessagingBundles(out, extras.getParcelableArray(Notification.EXTRA_MESSAGES));
-                  appendMessagingBundles(out, extras.getParcelableArray(Notification.EXTRA_HISTORIC_MESSAGES));
-
-                  // OEM Mesajlar uygulamalarinin farkli extra anahtarlarini da yerel olarak tara.
-                  for (String key : extras.keySet()) {
-                      Object value = extras.get(key);
-                      if (value instanceof CharSequence) {
-                          append(out, (CharSequence) value);
-                      } else if (value instanceof CharSequence[]) {
-                          for (CharSequence cs : (CharSequence[]) value) append(out, cs);
-                      } else if (value instanceof Bundle) {
-                          Bundle b = (Bundle) value;
-                          append(out, b.getCharSequence("text"));
-                          append(out, b.getCharSequence("title"));
-                      } else if (value instanceof Parcelable[]) {
-                          appendMessagingBundles(out, (Parcelable[]) value);
-                      }
-                  }
-
+                  appendBundle(out, extras, 0);
                   return out.toString();
               }
 
-              private static void appendMessagingBundles(StringBuilder out, Parcelable[] items) {
-                  if (items == null) return;
-                  for (Parcelable p : items) {
-                      if (p instanceof Bundle) {
-                          Bundle b = (Bundle) p;
-                          append(out, b.getCharSequence("text"));
-                          append(out, b.getCharSequence("sender"));
-                          append(out, b.getCharSequence("sender_person"));
+              private static void appendBundle(StringBuilder out, Bundle bundle, int depth) {
+                  if (bundle == null || depth > 3) return;
+                  for (String key : bundle.keySet()) {
+                      Object value;
+                      try {
+                          value = bundle.get(key);
+                      } catch (Exception e) {
+                          continue;
                       }
+                      appendValue(out, value, depth + 1);
+                  }
+              }
+
+              private static void appendValue(StringBuilder out, Object value, int depth) {
+                  if (value == null || depth > 4) return;
+                  if (value instanceof CharSequence) {
+                      append(out, (CharSequence) value);
+                  } else if (value instanceof CharSequence[]) {
+                      for (CharSequence item : (CharSequence[]) value) append(out, item);
+                  } else if (value instanceof Bundle) {
+                      appendBundle(out, (Bundle) value, depth);
+                  } else if (value instanceof Parcelable[]) {
+                      for (Parcelable p : (Parcelable[]) value) appendValue(out, p, depth + 1);
+                  } else if (value instanceof ArrayList) {
+                      for (Object item : (ArrayList<?>) value) appendValue(out, item, depth + 1);
                   }
               }
 
@@ -237,6 +368,368 @@ jobs:
                   if (value == null || value.length() == 0) return;
                   if (out.length() > 0) out.append('\n');
                   out.append(value);
+              }
+          }
+          JAVA
+
+          cat > app/src/main/java/com/venas/hizligiris/SmsReceiver.java <<'JAVA'
+          package com.venas.hizligiris;
+
+          import android.content.BroadcastReceiver;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.provider.Telephony;
+          import android.telephony.SmsMessage;
+
+          public class SmsReceiver extends BroadcastReceiver {
+              @Override
+              public void onReceive(Context context, Intent intent) {
+                  if (context == null || intent == null) return;
+                  if (!Telephony.Sms.Intents.SMS_RECEIVED_ACTION.equals(intent.getAction())) return;
+
+                  SmsMessage[] messages;
+                  try {
+                      messages = Telephony.Sms.Intents.getMessagesFromIntent(intent);
+                  } catch (Exception e) {
+                      return;
+                  }
+                  if (messages == null || messages.length == 0) return;
+
+                  StringBuilder body = new StringBuilder();
+                  for (SmsMessage msg : messages) {
+                      if (msg != null && msg.getMessageBody() != null) {
+                          body.append(msg.getMessageBody());
+                      }
+                  }
+
+                  String text = body.toString();
+                  OtpParser.Result result = OtpParser.parse(text);
+                  if (result != null) {
+                      OtpStore.save(context, result.otp, result.reference, System.currentTimeMillis(), "SMS");
+                  } else if (OtpParser.looksLikeContext(text)) {
+                      OtpStore.note(context, "SMS geldi; İş Turkcell metni görüldü ama 6 haneli kod bulunamadı");
+                  }
+              }
+          }
+          JAVA
+
+          cat > app/src/main/java/com/venas/hizligiris/MainActivity.java <<'JAVA'
+          package com.venas.hizligiris;
+
+          import android.Manifest;
+          import android.app.Activity;
+          import android.content.ClipData;
+          import android.content.ClipboardManager;
+          import android.content.ComponentName;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.content.pm.PackageManager;
+          import android.graphics.Color;
+          import android.graphics.Typeface;
+          import android.os.Build;
+          import android.os.Bundle;
+          import android.os.Handler;
+          import android.os.Looper;
+          import android.provider.Settings;
+          import android.text.TextUtils;
+          import android.view.Gravity;
+          import android.view.View;
+          import android.widget.Button;
+          import android.widget.ImageView;
+          import android.widget.LinearLayout;
+          import android.widget.ScrollView;
+          import android.widget.TextView;
+          import android.widget.Toast;
+
+          import java.text.SimpleDateFormat;
+          import java.util.Date;
+          import java.util.Locale;
+
+          public class MainActivity extends Activity {
+              private static final int REQ_SMS = 1201;
+              private final Handler handler = new Handler(Looper.getMainLooper());
+              private TextView listenerStatus;
+              private TextView smsStatus;
+              private TextView eventView;
+              private TextView otpView;
+              private TextView refView;
+              private TextView sourceView;
+              private TextView timeView;
+              private TextView serverView;
+              private Button copyButton;
+              private Button smsButton;
+              private String visibleOtp = "";
+
+              private final Runnable refresher = new Runnable() {
+                  @Override public void run() {
+                      refresh();
+                      handler.postDelayed(this, 1000L);
+                  }
+              };
+
+              @Override
+              protected void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+                  setContentView(buildUi());
+              }
+
+              @Override
+              protected void onResume() {
+                  super.onResume();
+                  handler.removeCallbacks(refresher);
+                  handler.post(refresher);
+              }
+
+              @Override
+              protected void onPause() {
+                  handler.removeCallbacks(refresher);
+                  super.onPause();
+              }
+
+              @Override
+              public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
+                  super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+                  if (requestCode == REQ_SMS) {
+                      if (grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+                          Toast.makeText(this, "SMS erişimi açıldı.", Toast.LENGTH_SHORT).show();
+                      } else {
+                          Toast.makeText(this, "SMS erişimi verilmedi. Bildirim yöntemi çalışmaya devam eder.", Toast.LENGTH_LONG).show();
+                      }
+                      refresh();
+                  }
+              }
+
+              private View buildUi() {
+                  ScrollView scroll = new ScrollView(this);
+                  scroll.setBackgroundColor(Color.rgb(5, 7, 10));
+
+                  LinearLayout root = new LinearLayout(this);
+                  root.setOrientation(LinearLayout.VERTICAL);
+                  root.setPadding(dp(22), dp(28), dp(22), dp(28));
+                  scroll.addView(root);
+
+                  ImageView logo = new ImageView(this);
+                  logo.setImageResource(com.venas.hizligiris.R.drawable.venas_logo);
+                  logo.setAdjustViewBounds(true);
+                  LinearLayout.LayoutParams logoLp = new LinearLayout.LayoutParams(dp(118), dp(118));
+                  logoLp.gravity = Gravity.CENTER_HORIZONTAL;
+                  root.addView(logo, logoLp);
+
+                  TextView title = text("Venas Hızlı Giriş", 26, true, Color.WHITE);
+                  title.setGravity(Gravity.CENTER);
+                  title.setPadding(0, dp(10), 0, dp(4));
+                  root.addView(title, matchWrap());
+
+                  TextView subtitle = text("İş Turkcell kod yardımcısı", 15, false, Color.rgb(170, 182, 201));
+                  subtitle.setGravity(Gravity.CENTER);
+                  subtitle.setPadding(0, 0, 0, dp(22));
+                  root.addView(subtitle, matchWrap());
+
+                  listenerStatus = text("", 15, true, Color.WHITE);
+                  root.addView(card("Bildirim erişimi", listenerStatus));
+
+                  Button access = button("BİLDİRİM ERİŞİMİNİ AÇ");
+                  access.setOnClickListener(v -> {
+                      try {
+                          startActivity(new Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS));
+                      } catch (Exception e) {
+                          Toast.makeText(this, "Bildirim erişimi ayarları açılamadı.", Toast.LENGTH_LONG).show();
+                      }
+                  });
+                  root.addView(access, buttonLp());
+
+                  smsStatus = text("", 15, true, Color.WHITE);
+                  root.addView(card("Doğrudan SMS erişimi", smsStatus));
+
+                  smsButton = button("SMS İZNİNİ AÇ");
+                  smsButton.setOnClickListener(v -> requestSmsPermission());
+                  root.addView(smsButton, buttonLp());
+
+                  eventView = text("Henüz İş Turkcell mesajı algılanmadı", 13, false, Color.rgb(170, 182, 201));
+                  root.addView(card("Son algılama", eventView));
+
+                  TextView codeLabel = text("Son Hızlı Giriş Kodu", 14, true, Color.rgb(170, 182, 201));
+                  codeLabel.setPadding(dp(16), dp(18), dp(16), dp(2));
+                  root.addView(codeLabel, matchWrap());
+
+                  otpView = text("------", 42, true, Color.WHITE);
+                  otpView.setGravity(Gravity.CENTER);
+                  otpView.setLetterSpacing(0.12f);
+                  otpView.setPadding(dp(10), dp(10), dp(10), dp(10));
+                  root.addView(otpView, matchWrap());
+
+                  refView = text("Referans: —", 16, true, Color.rgb(84, 155, 255));
+                  refView.setGravity(Gravity.CENTER);
+                  root.addView(refView, matchWrap());
+
+                  sourceView = text("Kaynak: —", 13, false, Color.rgb(150, 160, 176));
+                  sourceView.setGravity(Gravity.CENTER);
+                  root.addView(sourceView, matchWrap());
+
+                  timeView = text("Yeni kod bekleniyor", 13, false, Color.rgb(150, 160, 176));
+                  timeView.setGravity(Gravity.CENTER);
+                  timeView.setPadding(0, dp(6), 0, dp(14));
+                  root.addView(timeView, matchWrap());
+
+                  copyButton = button("KODU KOPYALA");
+                  copyButton.setEnabled(false);
+                  copyButton.setOnClickListener(v -> copyOtp());
+                  root.addView(copyButton, buttonLp());
+
+                  serverView = text("Henüz test edilmedi", 14, false, Color.rgb(170, 182, 201));
+                  root.addView(card("onqam.com durumu", serverView));
+
+                  Button test = button("SUNUCUYU TEST ET");
+                  test.setOnClickListener(v -> testServer());
+                  root.addView(test, buttonLp());
+
+                  TextView info = text(
+                          "Kod iki yoldan yakalanır: Mesajlar bildirimi veya doğrudan gelen SMS. Hangisi önce yakalarsa telefonda gösterilir.",
+                          13, false, Color.rgb(145, 156, 174));
+                  info.setPadding(dp(8), dp(18), dp(8), 0);
+                  root.addView(info, matchWrap());
+
+                  return scroll;
+              }
+
+              private void requestSmsPermission() {
+                  if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M || isSmsPermissionGranted()) {
+                      Toast.makeText(this, "SMS erişimi zaten açık.", Toast.LENGTH_SHORT).show();
+                      return;
+                  }
+                  requestPermissions(new String[]{Manifest.permission.RECEIVE_SMS}, REQ_SMS);
+              }
+
+              private void refresh() {
+                  boolean listener = isListenerEnabled();
+                  listenerStatus.setText(listener ? "Aktif ✓" : "Kapalı — izin gerekli");
+                  listenerStatus.setTextColor(listener ? Color.rgb(89, 219, 143) : Color.rgb(255, 178, 85));
+
+                  boolean sms = isSmsPermissionGranted();
+                  smsStatus.setText(sms ? "Aktif ✓" : "Kapalı — SMS izni gerekli");
+                  smsStatus.setTextColor(sms ? Color.rgb(89, 219, 143) : Color.rgb(255, 178, 85));
+                  if (smsButton != null) smsButton.setEnabled(!sms);
+
+                  String event = OtpStore.lastEvent(this);
+                  long eventTs = OtpStore.lastEventTime(this);
+                  if (eventTs > 0L) {
+                      String eventTime = new SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(new Date(eventTs));
+                      eventView.setText(event + " • " + eventTime);
+                  } else {
+                      eventView.setText(event);
+                  }
+
+                  OtpStore.Entry entry = OtpStore.current(this);
+                  if (entry == null) {
+                      visibleOtp = "";
+                      otpView.setText("------");
+                      refView.setText("Referans: —");
+                      sourceView.setText("Kaynak: —");
+                      timeView.setText("Yeni kod bekleniyor");
+                      copyButton.setEnabled(false);
+                      return;
+                  }
+
+                  visibleOtp = entry.otp;
+                  otpView.setText(entry.otp);
+                  refView.setText(TextUtils.isEmpty(entry.reference) ? "Referans: bulunamadı" : "Referans: " + entry.reference);
+                  sourceView.setText("Kaynak: " + (TextUtils.isEmpty(entry.source) ? "—" : entry.source));
+                  String stamp = new SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(new Date(entry.timestamp));
+                  long left = Math.max(0L, 180L - ((System.currentTimeMillis() - entry.timestamp) / 1000L));
+                  timeView.setText("Algılandı: " + stamp + "  •  " + left + " sn sonra temizlenir");
+                  copyButton.setEnabled(true);
+              }
+
+              private boolean isSmsPermissionGranted() {
+                  return Build.VERSION.SDK_INT < Build.VERSION_CODES.M
+                          || checkSelfPermission(Manifest.permission.RECEIVE_SMS) == PackageManager.PERMISSION_GRANTED;
+              }
+
+              private void copyOtp() {
+                  if (visibleOtp.length() != 6) return;
+                  ClipboardManager cm = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
+                  if (cm == null) return;
+                  cm.setPrimaryClip(ClipData.newPlainText("Venas Hızlı Giriş", visibleOtp));
+                  Toast.makeText(this, "Kod panoya kopyalandı.", Toast.LENGTH_SHORT).show();
+              }
+
+              private void testServer() {
+                  serverView.setText("Test ediliyor…");
+                  new Thread(() -> {
+                      try {
+                          int code = ServerStatusClient.check();
+                          runOnUiThread(() -> {
+                              if (code >= 200 && code < 300) {
+                                  serverView.setText("Erişilebilir ✓  HTTP " + code);
+                                  serverView.setTextColor(Color.rgb(89, 219, 143));
+                              } else {
+                                  serverView.setText("Yanıt alındı: HTTP " + code);
+                                  serverView.setTextColor(Color.rgb(255, 178, 85));
+                              }
+                          });
+                      } catch (Exception e) {
+                          runOnUiThread(() -> {
+                              serverView.setText("Bağlantı hatası");
+                              serverView.setTextColor(Color.rgb(255, 113, 113));
+                          });
+                      }
+                  }, "VenasStatusTest").start();
+              }
+
+              private boolean isListenerEnabled() {
+                  String enabled = Settings.Secure.getString(getContentResolver(), "enabled_notification_listeners");
+                  if (enabled == null) return false;
+                  ComponentName me = new ComponentName(this, OtpNotificationListener.class);
+                  return enabled.contains(me.flattenToString()) || enabled.contains(getPackageName());
+              }
+
+              private LinearLayout card(String label, TextView value) {
+                  LinearLayout box = new LinearLayout(this);
+                  box.setOrientation(LinearLayout.VERTICAL);
+                  box.setPadding(dp(16), dp(14), dp(16), dp(14));
+                  box.setBackgroundColor(Color.rgb(18, 24, 34));
+                  TextView labelView = text(label, 12, true, Color.rgb(137, 150, 171));
+                  box.addView(labelView, matchWrap());
+                  value.setPadding(0, dp(5), 0, 0);
+                  box.addView(value, matchWrap());
+                  LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+                  lp.setMargins(0, dp(8), 0, dp(8));
+                  box.setLayoutParams(lp);
+                  return box;
+              }
+
+              private TextView text(String text, int sp, boolean bold, int color) {
+                  TextView tv = new TextView(this);
+                  tv.setText(text);
+                  tv.setTextSize(sp);
+                  tv.setTextColor(color);
+                  if (bold) tv.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
+                  return tv;
+              }
+
+              private Button button(String label) {
+                  Button b = new Button(this);
+                  b.setText(label);
+                  b.setTextSize(14);
+                  b.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
+                  b.setTextColor(Color.WHITE);
+                  b.setBackgroundTintList(android.content.res.ColorStateList.valueOf(Color.rgb(35, 104, 224)));
+                  b.setAllCaps(false);
+                  return b;
+              }
+
+              private LinearLayout.LayoutParams buttonLp() {
+                  LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(54));
+                  lp.setMargins(0, dp(8), 0, dp(10));
+                  return lp;
+              }
+
+              private LinearLayout.LayoutParams matchWrap() {
+                  return new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+              }
+
+              private int dp(int value) {
+                  return Math.round(value * getResources().getDisplayMetrics().density);
               }
           }
           JAVA
@@ -254,8 +747,8 @@ jobs:
                   applicationId 'com.venas.hizligiris.safe'
                   minSdk 26
                   targetSdk 35
-                  versionCode 13
-                  versionName '1.1.2'
+                  versionCode 14
+                  versionName '1.1.3'
               }
 
               buildTypes {
@@ -281,11 +774,11 @@ jobs:
         run: gradle :app:assembleDebug --stacktrace
 
       - name: APK adini duzelt
-        run: cp app/build/outputs/apk/debug/app-debug.apk VenasHizliGiris-v1.1.2.apk
+        run: cp app/build/outputs/apk/debug/app-debug.apk VenasHizliGiris-v1.1.3.apk
 
       - name: APK yi artifact olarak yukle
         uses: actions/upload-artifact@v4
         with:
-          name: VenasHizliGiris-v1.1.2-APK
-          path: VenasHizliGiris-v1.1.2.apk
+          name: VenasHizliGiris-v1.1.3-APK
+          path: VenasHizliGiris-v1.1.3.apk
           if-no-files-found: error
