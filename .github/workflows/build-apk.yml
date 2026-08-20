@@ -1,4 +1,5 @@
-name: Build Venas Hizli Giris APK
+
+name: Build Venas Hizli Giris APK v1.1.1
 
 on:
   push:
@@ -25,14 +26,14 @@ jobs:
       - name: Android SDK kur
         uses: android-actions/setup-android@v3
 
-      - name: Android 36 paketlerini kur
+      - name: Android paketlerini kur
         run: sdkmanager "platforms;android-36" "build-tools;35.0.0"
 
-      - name: Telefonda duz yuklenen dosyalardan Android klasor yapisini olustur
+      - name: Android proje yapisini olustur ve bildirim algilamayi guclendir
         shell: bash
         run: |
           set -e
-          required=(AndroidManifest.xml MainActivity.java OtpNotificationListener.java OtpParser.java OtpStore.java ServerStatusClient.java strings.xml styles.xml venas_logo.png proguard-rules.pro)
+          required=(AndroidManifest.xml MainActivity.java OtpStore.java ServerStatusClient.java strings.xml styles.xml venas_logo.png proguard-rules.pro)
           for f in "${required[@]}"; do
             if [ ! -f "$f" ]; then
               echo "EKSIK DOSYA: $f"
@@ -46,14 +47,200 @@ jobs:
 
           cp AndroidManifest.xml app/src/main/AndroidManifest.xml
           cp MainActivity.java app/src/main/java/com/venas/hizligiris/MainActivity.java
-          cp OtpNotificationListener.java app/src/main/java/com/venas/hizligiris/OtpNotificationListener.java
-          cp OtpParser.java app/src/main/java/com/venas/hizligiris/OtpParser.java
           cp OtpStore.java app/src/main/java/com/venas/hizligiris/OtpStore.java
           cp ServerStatusClient.java app/src/main/java/com/venas/hizligiris/ServerStatusClient.java
           cp strings.xml app/src/main/res/values/strings.xml
           cp styles.xml app/src/main/res/values/styles.xml
           cp venas_logo.png app/src/main/res/drawable/venas_logo.png
           cp proguard-rules.pro app/proguard-rules.pro
+
+          cat > app/src/main/java/com/venas/hizligiris/OtpParser.java <<'JAVA'
+          package com.venas.hizligiris;
+
+          import java.util.Locale;
+          import java.util.regex.Matcher;
+          import java.util.regex.Pattern;
+
+          final class OtpParser {
+              private OtpParser() {}
+
+              private static final Pattern SIX_DIGIT = Pattern.compile("(?<!\\d)(\\d{6})(?!\\d)");
+              private static final Pattern REF_PATTERN = Pattern.compile(
+                      "(?i)referans\\s*[:\\-]?\\s*([A-Z0-9]{4,12}(?:\\s+B\\d{3})?)");
+
+              static Result parse(String text) {
+                  if (text == null || text.trim().isEmpty()) return null;
+
+                  String clean = text
+                          .replace('\u00A0', ' ')
+                          .replace('\u200B', ' ')
+                          .replace('\u200C', ' ')
+                          .replace('\u200D', ' ')
+                          .replace('\n', ' ')
+                          .replace('\r', ' ')
+                          .replace('\t', ' ');
+
+                  String canonical = canonicalize(clean);
+
+                  int phraseIndex = canonical.indexOf("hizli giris sifreniz");
+                  String otp = null;
+
+                  if (phraseIndex >= 0) {
+                      String after = canonical.substring(phraseIndex + "hizli giris sifreniz".length());
+                      Matcher m = SIX_DIGIT.matcher(after);
+                      if (m.find() && m.start() <= 40) otp = m.group(1);
+                  }
+
+                  if (otp == null && canonical.contains("hizli giris") && canonical.contains("sifreniz")) {
+                      int idx = canonical.indexOf("sifreniz");
+                      if (idx >= 0) {
+                          Matcher m = SIX_DIGIT.matcher(canonical.substring(idx));
+                          if (m.find() && m.start() <= 60) otp = m.group(1);
+                      }
+                  }
+
+                  if (otp == null) return null;
+
+                  String reference = "";
+                  Matcher refMatcher = REF_PATTERN.matcher(clean);
+                  if (refMatcher.find()) {
+                      reference = refMatcher.group(1).trim().toUpperCase(Locale.ROOT);
+                  }
+
+                  return new Result(otp, reference);
+              }
+
+              static boolean looksLikeFastLogin(String text) {
+                  if (text == null) return false;
+                  String c = canonicalize(text);
+                  return c.contains("hizli giris") || c.contains("sifreniz") || c.contains("isturkcell");
+              }
+
+              private static String canonicalize(String s) {
+                  String c = s.toLowerCase(new Locale("tr", "TR"));
+                  c = c.replace('ı', 'i')
+                       .replace('ş', 's')
+                       .replace('ğ', 'g')
+                       .replace('ü', 'u')
+                       .replace('ö', 'o')
+                       .replace('ç', 'c');
+                  c = c.replaceAll("[^a-z0-9]+", " ");
+                  return c.trim().replaceAll("\\s+", " ");
+              }
+
+              static final class Result {
+                  final String otp;
+                  final String reference;
+
+                  Result(String otp, String reference) {
+                      this.otp = otp;
+                      this.reference = reference;
+                  }
+              }
+          }
+          JAVA
+
+          cat > app/src/main/java/com/venas/hizligiris/OtpNotificationListener.java <<'JAVA'
+          package com.venas.hizligiris;
+
+          import android.app.Notification;
+          import android.content.ComponentName;
+          import android.os.Bundle;
+          import android.os.Parcelable;
+          import android.service.notification.NotificationListenerService;
+          import android.service.notification.StatusBarNotification;
+
+          public class OtpNotificationListener extends NotificationListenerService {
+              private String lastFingerprint = "";
+              private long lastFingerprintAt = 0L;
+
+              @Override
+              public void onNotificationPosted(StatusBarNotification sbn) {
+                  if (sbn == null || sbn.getNotification() == null) return;
+                  if (getPackageName().equals(sbn.getPackageName())) return;
+
+                  Notification n = sbn.getNotification();
+                  Bundle extras = n.extras;
+                  if (extras == null) return;
+
+                  String combined = collectAllText(extras);
+                  OtpParser.Result result = OtpParser.parse(combined);
+                  if (result == null) return;
+
+                  long now = System.currentTimeMillis();
+                  String fingerprint = result.otp + "|" + result.reference;
+                  if (fingerprint.equals(lastFingerprint) && now - lastFingerprintAt < 90_000L) return;
+
+                  lastFingerprint = fingerprint;
+                  lastFingerprintAt = now;
+                  OtpStore.save(this, result.otp, result.reference, now);
+              }
+
+              @Override
+              public void onListenerDisconnected() {
+                  super.onListenerDisconnected();
+                  try {
+                      requestRebind(new ComponentName(this, OtpNotificationListener.class));
+                  } catch (Exception ignored) {}
+              }
+
+              private static String collectAllText(Bundle extras) {
+                  StringBuilder out = new StringBuilder();
+
+                  append(out, extras.getCharSequence(Notification.EXTRA_TITLE));
+                  append(out, extras.getCharSequence(Notification.EXTRA_TITLE_BIG));
+                  append(out, extras.getCharSequence(Notification.EXTRA_TEXT));
+                  append(out, extras.getCharSequence(Notification.EXTRA_BIG_TEXT));
+                  append(out, extras.getCharSequence(Notification.EXTRA_SUB_TEXT));
+                  append(out, extras.getCharSequence(Notification.EXTRA_INFO));
+                  append(out, extras.getCharSequence(Notification.EXTRA_SUMMARY_TEXT));
+
+                  CharSequence[] lines = extras.getCharSequenceArray(Notification.EXTRA_TEXT_LINES);
+                  if (lines != null) {
+                      for (CharSequence line : lines) append(out, line);
+                  }
+
+                  appendMessagingBundles(out, extras.getParcelableArray(Notification.EXTRA_MESSAGES));
+                  appendMessagingBundles(out, extras.getParcelableArray(Notification.EXTRA_HISTORIC_MESSAGES));
+
+                  // OEM Mesajlar uygulamalarinin farkli extra anahtarlarini da yerel olarak tara.
+                  for (String key : extras.keySet()) {
+                      Object value = extras.get(key);
+                      if (value instanceof CharSequence) {
+                          append(out, (CharSequence) value);
+                      } else if (value instanceof CharSequence[]) {
+                          for (CharSequence cs : (CharSequence[]) value) append(out, cs);
+                      } else if (value instanceof Bundle) {
+                          Bundle b = (Bundle) value;
+                          append(out, b.getCharSequence("text"));
+                          append(out, b.getCharSequence("title"));
+                      } else if (value instanceof Parcelable[]) {
+                          appendMessagingBundles(out, (Parcelable[]) value);
+                      }
+                  }
+
+                  return out.toString();
+              }
+
+              private static void appendMessagingBundles(StringBuilder out, Parcelable[] items) {
+                  if (items == null) return;
+                  for (Parcelable p : items) {
+                      if (p instanceof Bundle) {
+                          Bundle b = (Bundle) p;
+                          append(out, b.getCharSequence("text"));
+                          append(out, b.getCharSequence("sender"));
+                          append(out, b.getCharSequence("sender_person"));
+                      }
+                  }
+              }
+
+              private static void append(StringBuilder out, CharSequence value) {
+                  if (value == null || value.length() == 0) return;
+                  if (out.length() > 0) out.append('\n');
+                  out.append(value);
+              }
+          }
+          JAVA
 
           cat > app/build.gradle <<'GRADLE'
           plugins {
@@ -68,8 +255,8 @@ jobs:
                   applicationId 'com.venas.hizligiris.safe'
                   minSdk 26
                   targetSdk 35
-                  versionCode 11
-                  versionName '1.1.0'
+                  versionCode 12
+                  versionName '1.1.1'
               }
 
               buildTypes {
@@ -95,11 +282,11 @@ jobs:
         run: gradle :app:assembleDebug --stacktrace
 
       - name: APK adini duzelt
-        run: cp app/build/outputs/apk/debug/app-debug.apk VenasHizliGiris-v1.1.0.apk
+        run: cp app/build/outputs/apk/debug/app-debug.apk VenasHizliGiris-v1.1.1.apk
 
-      - name: APK'yi artifact olarak yukle
+      - name: APK yi artifact olarak yukle
         uses: actions/upload-artifact@v4
         with:
-          name: VenasHizliGiris-v1.1.0-APK
-          path: VenasHizliGiris-v1.1.0.apk
+          name: VenasHizliGiris-v1.1.1-APK
+          path: VenasHizliGiris-v1.1.1.apk
           if-no-files-found: error
