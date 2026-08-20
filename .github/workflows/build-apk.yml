@@ -1,4 +1,4 @@
-name: Build Venas Hizli Giris APK v1.1.4
+name: Build Venas Hizli Giris APK v1.1.5
 
 on:
   push:
@@ -33,7 +33,7 @@ jobs:
         run: |
           set -e
 
-          required=(ServerStatusClient.java strings.xml styles.xml venas_logo.png proguard-rules.pro)
+          required=(strings.xml styles.xml venas_logo.png proguard-rules.pro)
           for f in "${required[@]}"; do
             if [ ! -f "$f" ]; then
               echo "EKSIK DOSYA: $f"
@@ -45,7 +45,6 @@ jobs:
           mkdir -p app/src/main/res/values
           mkdir -p app/src/main/res/drawable
 
-          cp ServerStatusClient.java app/src/main/java/com/venas/hizligiris/ServerStatusClient.java
           cp strings.xml app/src/main/res/values/strings.xml
           cp styles.xml app/src/main/res/values/styles.xml
           cp venas_logo.png app/src/main/res/drawable/venas_logo.png
@@ -194,6 +193,64 @@ jobs:
           }
           JAVA
 
+          cat > app/src/main/java/com/venas/hizligiris/AppConfig.java <<'JAVA'
+          package com.venas.hizligiris;
+
+          import android.content.Context;
+          import android.content.SharedPreferences;
+
+          import java.util.Locale;
+
+          final class AppConfig {
+              private AppConfig() {}
+
+              static final String BASE_URL =
+                      "https://onqam.com/wp-json/venas-otp/v1";
+
+              private static final String PREF = "venas_hizli_giris";
+              private static final String KEY_API = "mobile_api_key";
+
+              static String getApiKey(Context context) {
+                  String value = prefs(context).getString(KEY_API, "");
+                  return value == null ? "" : value.trim().toLowerCase(Locale.ROOT);
+              }
+
+              static boolean saveApiKey(Context context, String value) {
+                  String normalized =
+                          value == null
+                                  ? ""
+                                  : value.trim().toLowerCase(Locale.ROOT);
+
+                  if (!isValidApiKey(normalized)) return false;
+
+                  prefs(context)
+                          .edit()
+                          .putString(KEY_API, normalized)
+                          .apply();
+
+                  return true;
+              }
+
+              static void clearApiKey(Context context) {
+                  prefs(context)
+                          .edit()
+                          .remove(KEY_API)
+                          .apply();
+              }
+
+              static boolean isValidApiKey(String value) {
+                  return value != null
+                          && value.matches("(?i)^[a-f0-9]{48}$");
+              }
+
+              private static SharedPreferences prefs(Context context) {
+                  return context.getSharedPreferences(
+                          PREF,
+                          Context.MODE_PRIVATE);
+              }
+          }
+          JAVA
+
           cat > app/src/main/java/com/venas/hizligiris/OtpStore.java <<'JAVA'
           package com.venas.hizligiris;
 
@@ -220,16 +277,54 @@ jobs:
                           .putLong("timestamp", timestamp)
                           .putString(
                                   "last_event",
-                                  (source == null ? "" : source) + ": 6 haneli kod yakalandı")
+                                  (source == null ? "" : source)
+                                          + ": 6 haneli kod yakalandı")
                           .putLong("last_event_ts", timestamp)
                           .apply();
               }
 
               static void note(Context context, String note) {
                   prefs(context).edit()
-                          .putString("last_event", note == null ? "" : note)
-                          .putLong("last_event_ts", System.currentTimeMillis())
+                          .putString(
+                                  "last_event",
+                                  note == null ? "" : note)
+                          .putLong(
+                                  "last_event_ts",
+                                  System.currentTimeMillis())
                           .apply();
+              }
+
+              static void noteServer(
+                      Context context,
+                      boolean ok,
+                      String note) {
+
+                  prefs(context).edit()
+                          .putBoolean("server_ok", ok)
+                          .putString(
+                                  "server_event",
+                                  note == null ? "" : note)
+                          .putLong(
+                                  "server_event_ts",
+                                  System.currentTimeMillis())
+                          .apply();
+              }
+
+              static boolean lastServerOk(Context context) {
+                  return prefs(context)
+                          .getBoolean("server_ok", false);
+              }
+
+              static String lastServerEvent(Context context) {
+                  return prefs(context)
+                          .getString(
+                                  "server_event",
+                                  "API key kaydedilip bağlantı test edilmedi");
+              }
+
+              static long lastServerEventTime(Context context) {
+                  return prefs(context)
+                          .getLong("server_event_ts", 0L);
               }
 
               static Entry current(Context context) {
@@ -240,7 +335,9 @@ jobs:
                   String source = p.getString("source", "");
                   long ts = p.getLong("timestamp", 0L);
 
-                  if (otp == null || otp.length() != 6 || ts <= 0L) {
+                  if (otp == null
+                          || otp.length() != 6
+                          || ts <= 0L) {
                       return null;
                   }
 
@@ -268,11 +365,14 @@ jobs:
               }
 
               static long lastEventTime(Context context) {
-                  return prefs(context).getLong("last_event_ts", 0L);
+                  return prefs(context)
+                          .getLong("last_event_ts", 0L);
               }
 
               private static SharedPreferences prefs(Context context) {
-                  return context.getSharedPreferences(PREF, Context.MODE_PRIVATE);
+                  return context.getSharedPreferences(
+                          PREF,
+                          Context.MODE_PRIVATE);
               }
 
               static final class Entry {
@@ -281,11 +381,376 @@ jobs:
                   final String source;
                   final long timestamp;
 
-                  Entry(String otp, String reference, String source, long timestamp) {
+                  Entry(
+                          String otp,
+                          String reference,
+                          String source,
+                          long timestamp) {
+
                       this.otp = otp;
                       this.reference = reference;
                       this.source = source;
                       this.timestamp = timestamp;
+                  }
+              }
+          }
+          JAVA
+
+          cat > app/src/main/java/com/venas/hizligiris/OtpApiClient.java <<'JAVA'
+          package com.venas.hizligiris;
+
+          import android.content.Context;
+
+          import org.json.JSONObject;
+
+          import java.io.BufferedReader;
+          import java.io.InputStream;
+          import java.io.InputStreamReader;
+          import java.io.OutputStream;
+          import java.net.HttpURLConnection;
+          import java.net.URL;
+          import java.net.URLEncoder;
+          import java.nio.charset.StandardCharsets;
+
+          final class OtpApiClient {
+              private OtpApiClient() {}
+
+              private static final String MOBILE_KEY_HEADER =
+                      "X-Venas-Mobile-Key";
+
+              static Result testConnection(
+                      Context context,
+                      String apiKey) {
+
+                  Result result =
+                          post(
+                                  AppConfig.BASE_URL + "/mobile-test",
+                                  "ping=1",
+                                  apiKey);
+
+                  if (result.ok) {
+                      OtpStore.noteServer(
+                              context,
+                              true,
+                              "onqam.com bağlantısı doğrulandı");
+                  } else {
+                      OtpStore.noteServer(
+                              context,
+                              false,
+                              result.message);
+                  }
+
+                  return result;
+              }
+
+              static void sendOtpAsync(
+                      Context context,
+                      String otp,
+                      String reference,
+                      String source) {
+
+                  Context app =
+                          context.getApplicationContext();
+
+                  new Thread(() -> {
+                      sendOtpWithRetry(
+                              app,
+                              otp,
+                              reference,
+                              source);
+                  }, "VenasOtpUpload").start();
+              }
+
+              static Result sendOtpWithRetry(
+                      Context context,
+                      String otp,
+                      String reference,
+                      String source) {
+
+                  String apiKey =
+                          AppConfig.getApiKey(context);
+
+                  if (!AppConfig.isValidApiKey(apiKey)) {
+                      Result result =
+                              new Result(
+                                      false,
+                                      0,
+                                      "API key girilmedi; OTP sunucuya gönderilmedi");
+
+                      OtpStore.noteServer(
+                              context,
+                              false,
+                              result.message);
+
+                      return result;
+                  }
+
+                  Result last =
+                          new Result(
+                                  false,
+                                  0,
+                                  "Gönderim başlatılamadı");
+
+                  long[] waits = new long[]{0L, 1000L, 2500L};
+
+                  for (int i = 0; i < waits.length; i++) {
+                      if (waits[i] > 0L) {
+                          try {
+                              Thread.sleep(waits[i]);
+                          } catch (InterruptedException e) {
+                              Thread.currentThread().interrupt();
+                              break;
+                          }
+                      }
+
+                      last =
+                              sendOtp(
+                                      apiKey,
+                                      otp,
+                                      reference,
+                                      source);
+
+                      if (last.ok) {
+                          OtpStore.noteServer(
+                                  context,
+                                  true,
+                                  "OTP onqam.com'a gönderildi");
+
+                          return last;
+                      }
+
+                      // Yetki ve doğrulama hatalarında yeniden deneme anlamsızdır.
+                      if (last.httpCode == 401
+                              || last.httpCode == 403
+                              || last.httpCode == 422) {
+                          break;
+                      }
+                  }
+
+                  OtpStore.noteServer(
+                          context,
+                          false,
+                          last.message);
+
+                  return last;
+              }
+
+              private static Result sendOtp(
+                      String apiKey,
+                      String otp,
+                      String reference,
+                      String source) {
+
+                  try {
+                      String body =
+                              "otp="
+                                      + enc(otp)
+                                      + "&reference="
+                                      + enc(reference)
+                                      + "&sender="
+                                      + enc("HIZLIGIRIS")
+                                      + "&source="
+                                      + enc(source);
+
+                      return post(
+                              AppConfig.BASE_URL + "/push",
+                              body,
+                              apiKey);
+                  } catch (Exception e) {
+                      return new Result(
+                              false,
+                              0,
+                              "OTP gönderilemedi: "
+                                      + safeMessage(e));
+                  }
+              }
+
+              private static Result post(
+                      String target,
+                      String formBody,
+                      String apiKey) {
+
+                  HttpURLConnection connection = null;
+
+                  try {
+                      URL url = new URL(target);
+
+                      connection =
+                              (HttpURLConnection)
+                                      url.openConnection();
+
+                      connection.setConnectTimeout(8000);
+                      connection.setReadTimeout(8000);
+                      connection.setRequestMethod("POST");
+                      connection.setDoOutput(true);
+                      connection.setUseCaches(false);
+                      connection.setRequestProperty(
+                              "Accept",
+                              "application/json");
+                      connection.setRequestProperty(
+                              "Content-Type",
+                              "application/x-www-form-urlencoded; charset=UTF-8");
+                      connection.setRequestProperty(
+                              MOBILE_KEY_HEADER,
+                              apiKey == null ? "" : apiKey);
+
+                      byte[] bytes =
+                              formBody.getBytes(
+                                      StandardCharsets.UTF_8);
+
+                      connection.setFixedLengthStreamingMode(
+                              bytes.length);
+
+                      try (OutputStream out =
+                                   connection.getOutputStream()) {
+                          out.write(bytes);
+                          out.flush();
+                      }
+
+                      int code =
+                              connection.getResponseCode();
+
+                      String response =
+                              readBody(
+                                      code >= 200 && code < 400
+                                              ? connection.getInputStream()
+                                              : connection.getErrorStream());
+
+                      boolean ok =
+                              code >= 200
+                                      && code < 300;
+
+                      String message =
+                              parseMessage(
+                                      response,
+                                      code,
+                                      ok);
+
+                      return new Result(
+                              ok,
+                              code,
+                              message);
+
+                  } catch (Exception e) {
+                      return new Result(
+                              false,
+                              0,
+                              "Bağlantı hatası: "
+                                      + safeMessage(e));
+                  } finally {
+                      if (connection != null) {
+                          connection.disconnect();
+                      }
+                  }
+              }
+
+              private static String parseMessage(
+                      String body,
+                      int code,
+                      boolean ok) {
+
+                  if (body != null
+                          && !body.trim().isEmpty()) {
+                      try {
+                          JSONObject object =
+                                  new JSONObject(body);
+
+                          String status =
+                                  object.optString(
+                                          "status",
+                                          "");
+
+                          String message =
+                                  object.optString(
+                                          "message",
+                                          "");
+
+                          if (!message.isEmpty()) {
+                              return "HTTP "
+                                      + code
+                                      + " • "
+                                      + message;
+                          }
+
+                          if (!status.isEmpty()) {
+                              return "HTTP "
+                                      + code
+                                      + " • "
+                                      + status;
+                          }
+                      } catch (Exception ignored) {
+                      }
+                  }
+
+                  return ok
+                          ? "HTTP " + code + " • başarılı"
+                          : "HTTP " + code + " • sunucu reddetti";
+              }
+
+              private static String readBody(
+                      InputStream input) {
+
+                  if (input == null) return "";
+
+                  try (BufferedReader reader =
+                               new BufferedReader(
+                                       new InputStreamReader(
+                                               input,
+                                               StandardCharsets.UTF_8))) {
+
+                      StringBuilder out =
+                              new StringBuilder();
+
+                      String line;
+
+                      while ((line =
+                              reader.readLine()) != null) {
+                          out.append(line);
+                      }
+
+                      return out.toString();
+                  } catch (Exception e) {
+                      return "";
+                  }
+              }
+
+              private static String enc(String value)
+                      throws Exception {
+
+                  return URLEncoder.encode(
+                          value == null ? "" : value,
+                          "UTF-8");
+              }
+
+              private static String safeMessage(
+                      Exception e) {
+
+                  if (e == null) return "bilinmeyen hata";
+
+                  String message =
+                          e.getMessage();
+
+                  return message == null
+                          || message.trim().isEmpty()
+                          ? e.getClass().getSimpleName()
+                          : message;
+              }
+
+              static final class Result {
+                  final boolean ok;
+                  final int httpCode;
+                  final String message;
+
+                  Result(
+                          boolean ok,
+                          int httpCode,
+                          String message) {
+
+                      this.ok = ok;
+                      this.httpCode = httpCode;
+                      this.message = message == null
+                              ? ""
+                              : message;
                   }
               }
           }
@@ -301,7 +766,9 @@ jobs:
           import android.service.notification.NotificationListenerService;
           import android.service.notification.StatusBarNotification;
 
-          public class OtpNotificationListener extends NotificationListenerService {
+          public class OtpNotificationListener
+                  extends NotificationListenerService {
+
               private String lastFingerprint = "";
               private long lastFingerprintAt = 0L;
 
@@ -310,7 +777,9 @@ jobs:
                   super.onListenerConnected();
 
                   try {
-                      StatusBarNotification[] active = getActiveNotifications();
+                      StatusBarNotification[] active =
+                              getActiveNotifications();
+
                       if (active != null) {
                           for (StatusBarNotification sbn : active) {
                               process(sbn);
@@ -321,22 +790,39 @@ jobs:
               }
 
               @Override
-              public void onNotificationPosted(StatusBarNotification sbn) {
+              public void onNotificationPosted(
+                      StatusBarNotification sbn) {
+
                   process(sbn);
               }
 
-              private void process(StatusBarNotification sbn) {
-                  if (sbn == null || sbn.getNotification() == null) return;
-                  if (getPackageName().equals(sbn.getPackageName())) return;
+              private void process(
+                      StatusBarNotification sbn) {
 
-                  Bundle extras = sbn.getNotification().extras;
+                  if (sbn == null
+                          || sbn.getNotification() == null) {
+                      return;
+                  }
+
+                  if (getPackageName().equals(
+                          sbn.getPackageName())) {
+                      return;
+                  }
+
+                  Bundle extras =
+                          sbn.getNotification().extras;
+
                   if (extras == null) return;
 
-                  String combined = collectText(extras);
-                  OtpParser.Result result = OtpParser.parse(combined);
+                  String combined =
+                          collectText(extras);
+
+                  OtpParser.Result result =
+                          OtpParser.parse(combined);
 
                   if (result == null) {
-                      if (OtpParser.looksLikeContext(combined)) {
+                      if (OtpParser.looksLikeContext(
+                              combined)) {
                           OtpStore.note(
                                   this,
                                   "Bildirim geldi; İş Turkcell metni görüldü ama 6 haneli kod bulunamadı");
@@ -344,22 +830,37 @@ jobs:
                       return;
                   }
 
-                  long now = System.currentTimeMillis();
-                  String fingerprint = result.otp + "|" + result.reference;
+                  long now =
+                          System.currentTimeMillis();
 
-                  if (fingerprint.equals(lastFingerprint)
-                          && now - lastFingerprintAt < 90_000L) {
+                  String fingerprint =
+                          result.otp
+                                  + "|"
+                                  + result.reference;
+
+                  if (fingerprint.equals(
+                          lastFingerprint)
+                          && now - lastFingerprintAt
+                          < 90_000L) {
                       return;
                   }
 
-                  lastFingerprint = fingerprint;
-                  lastFingerprintAt = now;
+                  lastFingerprint =
+                          fingerprint;
+                  lastFingerprintAt =
+                          now;
 
                   OtpStore.save(
                           this,
                           result.otp,
                           result.reference,
                           now,
+                          "Bildirim");
+
+                  OtpApiClient.sendOtpAsync(
+                          this,
+                          result.otp,
+                          result.reference,
                           "Bildirim");
               }
 
@@ -376,19 +877,50 @@ jobs:
                   }
               }
 
-              private static String collectText(Bundle extras) {
-                  StringBuilder out = new StringBuilder();
+              private static String collectText(
+                      Bundle extras) {
 
-                  append(out, extras.getCharSequence(Notification.EXTRA_TITLE));
-                  append(out, extras.getCharSequence(Notification.EXTRA_TITLE_BIG));
-                  append(out, extras.getCharSequence(Notification.EXTRA_TEXT));
-                  append(out, extras.getCharSequence(Notification.EXTRA_BIG_TEXT));
-                  append(out, extras.getCharSequence(Notification.EXTRA_SUB_TEXT));
-                  append(out, extras.getCharSequence(Notification.EXTRA_INFO_TEXT));
-                  append(out, extras.getCharSequence(Notification.EXTRA_SUMMARY_TEXT));
+                  StringBuilder out =
+                          new StringBuilder();
+
+                  append(
+                          out,
+                          extras.getCharSequence(
+                                  Notification.EXTRA_TITLE));
+
+                  append(
+                          out,
+                          extras.getCharSequence(
+                                  Notification.EXTRA_TITLE_BIG));
+
+                  append(
+                          out,
+                          extras.getCharSequence(
+                                  Notification.EXTRA_TEXT));
+
+                  append(
+                          out,
+                          extras.getCharSequence(
+                                  Notification.EXTRA_BIG_TEXT));
+
+                  append(
+                          out,
+                          extras.getCharSequence(
+                                  Notification.EXTRA_SUB_TEXT));
+
+                  append(
+                          out,
+                          extras.getCharSequence(
+                                  Notification.EXTRA_INFO_TEXT));
+
+                  append(
+                          out,
+                          extras.getCharSequence(
+                                  Notification.EXTRA_SUMMARY_TEXT));
 
                   CharSequence[] lines =
-                          extras.getCharSequenceArray(Notification.EXTRA_TEXT_LINES);
+                          extras.getCharSequenceArray(
+                                  Notification.EXTRA_TEXT_LINES);
 
                   if (lines != null) {
                       for (CharSequence line : lines) {
@@ -398,11 +930,13 @@ jobs:
 
                   appendMessages(
                           out,
-                          extras.getParcelableArray(Notification.EXTRA_MESSAGES));
+                          extras.getParcelableArray(
+                                  Notification.EXTRA_MESSAGES));
 
                   appendMessages(
                           out,
-                          extras.getParcelableArray(Notification.EXTRA_HISTORIC_MESSAGES));
+                          extras.getParcelableArray(
+                                  Notification.EXTRA_HISTORIC_MESSAGES));
 
                   return out.toString();
               }
@@ -415,8 +949,13 @@ jobs:
 
                   for (Parcelable item : messages) {
                       if (item instanceof Bundle) {
-                          Bundle message = (Bundle) item;
-                          append(out, message.getCharSequence("text"));
+                          Bundle message =
+                                  (Bundle) item;
+
+                          append(
+                                  out,
+                                  message.getCharSequence(
+                                          "text"));
                       }
                   }
               }
@@ -425,7 +964,10 @@ jobs:
                       StringBuilder out,
                       CharSequence value) {
 
-                  if (value == null || value.length() == 0) return;
+                  if (value == null
+                          || value.length() == 0) {
+                      return;
+                  }
 
                   if (out.length() > 0) {
                       out.append('\n');
@@ -445,10 +987,18 @@ jobs:
           import android.provider.Telephony;
           import android.telephony.SmsMessage;
 
-          public class SmsReceiver extends BroadcastReceiver {
+          public class SmsReceiver
+                  extends BroadcastReceiver {
+
               @Override
-              public void onReceive(Context context, Intent intent) {
-                  if (context == null || intent == null) return;
+              public void onReceive(
+                      Context context,
+                      Intent intent) {
+
+                  if (context == null
+                          || intent == null) {
+                      return;
+                  }
 
                   if (!Telephony.Sms.Intents.SMS_RECEIVED_ACTION.equals(
                           intent.getAction())) {
@@ -459,18 +1009,25 @@ jobs:
 
                   try {
                       messages =
-                              Telephony.Sms.Intents.getMessagesFromIntent(intent);
+                              Telephony.Sms.Intents
+                                      .getMessagesFromIntent(
+                                              intent);
                   } catch (Exception e) {
                       return;
                   }
 
-                  if (messages == null || messages.length == 0) return;
+                  if (messages == null
+                          || messages.length == 0) {
+                      return;
+                  }
 
-                  StringBuilder body = new StringBuilder();
+                  StringBuilder body =
+                          new StringBuilder();
 
                   for (SmsMessage message : messages) {
                       if (message == null
-                              || message.getMessageBody() == null) {
+                              || message.getMessageBody()
+                              == null) {
                           continue;
                       }
 
@@ -478,24 +1035,53 @@ jobs:
                           body.append(' ');
                       }
 
-                      body.append(message.getMessageBody());
+                      body.append(
+                              message.getMessageBody());
                   }
 
-                  String text = body.toString();
-                  OtpParser.Result result = OtpParser.parse(text);
+                  String text =
+                          body.toString();
 
-                  if (result != null) {
-                      OtpStore.save(
-                              context,
-                              result.otp,
-                              result.reference,
-                              System.currentTimeMillis(),
-                              "SMS");
-                  } else if (OtpParser.looksLikeContext(text)) {
-                      OtpStore.note(
-                              context,
-                              "SMS geldi; İş Turkcell metni görüldü ama 6 haneli kod bulunamadı");
+                  OtpParser.Result result =
+                          OtpParser.parse(text);
+
+                  if (result == null) {
+                      if (OtpParser.looksLikeContext(
+                              text)) {
+                          OtpStore.note(
+                                  context,
+                                  "SMS geldi; İş Turkcell metni görüldü ama 6 haneli kod bulunamadı");
+                      }
+                      return;
                   }
+
+                  long now =
+                          System.currentTimeMillis();
+
+                  OtpStore.save(
+                          context,
+                          result.otp,
+                          result.reference,
+                          now,
+                          "SMS");
+
+                  PendingResult pending =
+                          goAsync();
+
+                  Context app =
+                          context.getApplicationContext();
+
+                  new Thread(() -> {
+                      try {
+                          OtpApiClient.sendOtpWithRetry(
+                                  app,
+                                  result.otp,
+                                  result.reference,
+                                  "SMS");
+                      } finally {
+                          pending.finish();
+                      }
+                  }, "VenasSmsUpload").start();
               }
           }
           JAVA
@@ -517,10 +1103,12 @@ jobs:
           import android.os.Handler;
           import android.os.Looper;
           import android.provider.Settings;
+          import android.text.InputType;
           import android.text.TextUtils;
           import android.view.Gravity;
           import android.view.View;
           import android.widget.Button;
+          import android.widget.EditText;
           import android.widget.ImageView;
           import android.widget.LinearLayout;
           import android.widget.ScrollView;
@@ -544,55 +1132,92 @@ jobs:
               private TextView timeView;
               private TextView eventView;
               private TextView serverView;
+              private EditText apiKeyInput;
               private Button copyButton;
               private String visibleOtp = "";
 
-              private final Runnable refresher = new Runnable() {
-                  @Override
-                  public void run() {
-                      refresh();
-                      handler.postDelayed(this, 1000L);
-                  }
-              };
+              private final Runnable refresher =
+                      new Runnable() {
+                          @Override
+                          public void run() {
+                              refresh();
+                              handler.postDelayed(
+                                      this,
+                                      1000L);
+                          }
+                      };
 
               @Override
-              protected void onCreate(Bundle savedInstanceState) {
-                  super.onCreate(savedInstanceState);
-                  setContentView(buildUi());
+              protected void onCreate(
+                      Bundle savedInstanceState) {
+
+                  super.onCreate(
+                          savedInstanceState);
+
+                  setContentView(
+                          buildUi());
               }
 
               @Override
               protected void onResume() {
                   super.onResume();
-                  handler.removeCallbacks(refresher);
-                  handler.post(refresher);
+                  handler.removeCallbacks(
+                          refresher);
+                  handler.post(
+                          refresher);
               }
 
               @Override
               protected void onPause() {
-                  handler.removeCallbacks(refresher);
+                  handler.removeCallbacks(
+                          refresher);
                   super.onPause();
               }
 
               private View buildUi() {
-                  ScrollView scroll = new ScrollView(this);
-                  scroll.setBackgroundColor(Color.rgb(5, 7, 10));
+                  ScrollView scroll =
+                          new ScrollView(this);
 
-                  LinearLayout root = new LinearLayout(this);
-                  root.setOrientation(LinearLayout.VERTICAL);
-                  root.setPadding(dp(22), dp(28), dp(22), dp(28));
+                  scroll.setBackgroundColor(
+                          Color.rgb(
+                                  5,
+                                  7,
+                                  10));
+
+                  LinearLayout root =
+                          new LinearLayout(this);
+
+                  root.setOrientation(
+                          LinearLayout.VERTICAL);
+
+                  root.setPadding(
+                          dp(22),
+                          dp(28),
+                          dp(22),
+                          dp(28));
+
                   scroll.addView(root);
 
-                  ImageView logo = new ImageView(this);
-                  logo.setImageResource(R.drawable.venas_logo);
-                  logo.setAdjustViewBounds(true);
+                  ImageView logo =
+                          new ImageView(this);
+
+                  logo.setImageResource(
+                          R.drawable.venas_logo);
+
+                  logo.setAdjustViewBounds(
+                          true);
 
                   LinearLayout.LayoutParams logoLp =
                           new LinearLayout.LayoutParams(
                                   dp(108),
                                   dp(108));
-                  logoLp.gravity = Gravity.CENTER_HORIZONTAL;
-                  root.addView(logo, logoLp);
+
+                  logoLp.gravity =
+                          Gravity.CENTER_HORIZONTAL;
+
+                  root.addView(
+                          logo,
+                          logoLp);
 
                   TextView title =
                           text(
@@ -600,65 +1225,244 @@ jobs:
                                   26,
                                   true,
                                   Color.WHITE);
-                  title.setGravity(Gravity.CENTER);
-                  title.setPadding(0, dp(8), 0, dp(3));
-                  root.addView(title, matchWrap());
+
+                  title.setGravity(
+                          Gravity.CENTER);
+
+                  title.setPadding(
+                          0,
+                          dp(8),
+                          0,
+                          dp(3));
+
+                  root.addView(
+                          title,
+                          matchWrap());
 
                   TextView subtitle =
                           text(
-                                  "İş Turkcell Hızlı Giriş kod yardımcısı",
+                                  "İş Turkcell OTP → onqam.com → Masaüstü",
                                   15,
                                   false,
-                                  Color.rgb(170, 182, 201));
-                  subtitle.setGravity(Gravity.CENTER);
-                  subtitle.setPadding(0, 0, 0, dp(18));
-                  root.addView(subtitle, matchWrap());
+                                  Color.rgb(
+                                          170,
+                                          182,
+                                          201));
 
-                  smsStatus = text("", 15, true, Color.WHITE);
-                  root.addView(card("SMS erişimi", smsStatus));
+                  subtitle.setGravity(
+                          Gravity.CENTER);
+
+                  subtitle.setPadding(
+                          0,
+                          0,
+                          0,
+                          dp(18));
+
+                  root.addView(
+                          subtitle,
+                          matchWrap());
+
+                  TextView apiLabel =
+                          text(
+                                  "Mobil API Key",
+                                  12,
+                                  true,
+                                  Color.rgb(
+                                          137,
+                                          150,
+                                          171));
+
+                  apiKeyInput =
+                          new EditText(this);
+
+                  apiKeyInput.setSingleLine(
+                          true);
+
+                  apiKeyInput.setHint(
+                          "WordPress'teki 48 haneli Mobil API Key");
+
+                  apiKeyInput.setTextColor(
+                          Color.WHITE);
+
+                  apiKeyInput.setHintTextColor(
+                          Color.rgb(
+                                  120,
+                                  132,
+                                  150));
+
+                  apiKeyInput.setTextSize(
+                          14);
+
+                  apiKeyInput.setInputType(
+                          InputType.TYPE_CLASS_TEXT
+                                  | InputType.TYPE_TEXT_VARIATION_PASSWORD);
+
+                  String savedKey =
+                          AppConfig.getApiKey(
+                                  this);
+
+                  if (!savedKey.isEmpty()) {
+                      apiKeyInput.setText(
+                              savedKey);
+                  }
+
+                  LinearLayout apiBox =
+                          new LinearLayout(this);
+
+                  apiBox.setOrientation(
+                          LinearLayout.VERTICAL);
+
+                  apiBox.setPadding(
+                          dp(16),
+                          dp(14),
+                          dp(16),
+                          dp(14));
+
+                  apiBox.setBackgroundColor(
+                          Color.rgb(
+                                  18,
+                                  24,
+                                  34));
+
+                  apiBox.addView(
+                          apiLabel,
+                          matchWrap());
+
+                  apiBox.addView(
+                          apiKeyInput,
+                          matchWrap());
+
+                  LinearLayout.LayoutParams apiBoxLp =
+                          new LinearLayout.LayoutParams(
+                                  LinearLayout.LayoutParams.MATCH_PARENT,
+                                  LinearLayout.LayoutParams.WRAP_CONTENT);
+
+                  apiBoxLp.setMargins(
+                          0,
+                          dp(8),
+                          0,
+                          dp(8));
+
+                  apiBox.setLayoutParams(
+                          apiBoxLp);
+
+                  root.addView(apiBox);
+
+                  Button saveConnect =
+                          button(
+                                  "API KEY'İ KAYDET VE BAĞLAN");
+
+                  saveConnect.setOnClickListener(
+                          v -> saveAndConnect());
+
+                  root.addView(
+                          saveConnect,
+                          buttonLp());
+
+                  serverView =
+                          text(
+                                  "API key kaydedilip bağlantı test edilmedi",
+                                  14,
+                                  false,
+                                  Color.rgb(
+                                          170,
+                                          182,
+                                          201));
+
+                  root.addView(
+                          card(
+                                  "onqam.com bağlantısı",
+                                  serverView));
+
+                  Button test =
+                          button(
+                                  "BAĞLANTIYI TEST ET");
+
+                  test.setOnClickListener(
+                          v -> testSavedConnection());
+
+                  root.addView(
+                          test,
+                          buttonLp());
+
+                  smsStatus =
+                          text(
+                                  "",
+                                  15,
+                                  true,
+                                  Color.WHITE);
+
+                  root.addView(
+                          card(
+                                  "SMS erişimi",
+                                  smsStatus));
 
                   Button smsPermission =
-                          button("SMS İZNİNİ VER");
+                          button(
+                                  "SMS İZNİNİ VER");
+
                   smsPermission.setOnClickListener(
-                          v -> requestSmsPermission());
-                  root.addView(smsPermission, buttonLp());
+                          v ->
+                                  requestSmsPermission());
+
+                  root.addView(
+                          smsPermission,
+                          buttonLp());
 
                   listenerStatus =
-                          text("", 15, true, Color.WHITE);
+                          text(
+                                  "",
+                                  15,
+                                  true,
+                                  Color.WHITE);
+
                   root.addView(
                           card(
                                   "Bildirim erişimi (yedek yöntem)",
                                   listenerStatus));
 
                   Button access =
-                          button("BİLDİRİM ERİŞİMİNİ AÇ");
-                  access.setOnClickListener(v -> {
-                      try {
-                          startActivity(
-                                  new Intent(
-                                          Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS));
-                      } catch (Exception e) {
-                          Toast.makeText(
-                                  this,
-                                  "Bildirim erişimi ayarları açılamadı.",
-                                  Toast.LENGTH_LONG)
-                                  .show();
-                      }
-                  });
-                  root.addView(access, buttonLp());
+                          button(
+                                  "BİLDİRİM ERİŞİMİNİ AÇ");
+
+                  access.setOnClickListener(
+                          v -> {
+                              try {
+                                  startActivity(
+                                          new Intent(
+                                                  Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS));
+                              } catch (Exception e) {
+                                  Toast.makeText(
+                                          this,
+                                          "Bildirim erişimi ayarları açılamadı.",
+                                          Toast.LENGTH_LONG)
+                                          .show();
+                              }
+                          });
+
+                  root.addView(
+                          access,
+                          buttonLp());
 
                   TextView codeLabel =
                           text(
                                   "Son Hızlı Giriş Kodu",
                                   14,
                                   true,
-                                  Color.rgb(170, 182, 201));
+                                  Color.rgb(
+                                          170,
+                                          182,
+                                          201));
+
                   codeLabel.setPadding(
                           dp(16),
                           dp(18),
                           dp(16),
                           dp(2));
-                  root.addView(codeLabel, matchWrap());
+
+                  root.addView(
+                          codeLabel,
+                          matchWrap());
 
                   otpView =
                           text(
@@ -666,87 +1470,206 @@ jobs:
                                   42,
                                   true,
                                   Color.WHITE);
-                  otpView.setGravity(Gravity.CENTER);
-                  otpView.setLetterSpacing(0.12f);
+
+                  otpView.setGravity(
+                          Gravity.CENTER);
+
+                  otpView.setLetterSpacing(
+                          0.12f);
+
                   otpView.setPadding(
                           dp(10),
                           dp(10),
                           dp(10),
                           dp(10));
-                  root.addView(otpView, matchWrap());
+
+                  root.addView(
+                          otpView,
+                          matchWrap());
 
                   refView =
                           text(
                                   "Referans: —",
                                   16,
                                   true,
-                                  Color.rgb(84, 155, 255));
-                  refView.setGravity(Gravity.CENTER);
-                  root.addView(refView, matchWrap());
+                                  Color.rgb(
+                                          84,
+                                          155,
+                                          255));
+
+                  refView.setGravity(
+                          Gravity.CENTER);
+
+                  root.addView(
+                          refView,
+                          matchWrap());
 
                   timeView =
                           text(
                                   "Yeni kod bekleniyor",
                                   13,
                                   false,
-                                  Color.rgb(150, 160, 176));
-                  timeView.setGravity(Gravity.CENTER);
+                                  Color.rgb(
+                                          150,
+                                          160,
+                                          176));
+
+                  timeView.setGravity(
+                          Gravity.CENTER);
+
                   timeView.setPadding(
                           0,
                           dp(6),
                           0,
                           dp(10));
-                  root.addView(timeView, matchWrap());
+
+                  root.addView(
+                          timeView,
+                          matchWrap());
 
                   eventView =
                           text(
                                   "Henüz İş Turkcell mesajı algılanmadı",
                                   13,
                                   false,
-                                  Color.rgb(170, 182, 201));
+                                  Color.rgb(
+                                          170,
+                                          182,
+                                          201));
+
                   root.addView(
                           card(
                                   "Son algılama",
                                   eventView));
 
                   copyButton =
-                          button("KODU KOPYALA");
-                  copyButton.setEnabled(false);
+                          button(
+                                  "KODU KOPYALA");
+
+                  copyButton.setEnabled(
+                          false);
+
                   copyButton.setOnClickListener(
                           v -> copyOtp());
-                  root.addView(copyButton, buttonLp());
 
-                  serverView =
-                          text(
-                                  "Henüz test edilmedi",
-                                  14,
-                                  false,
-                                  Color.rgb(170, 182, 201));
                   root.addView(
-                          card(
-                                  "onqam.com durumu",
-                                  serverView));
-
-                  Button test =
-                          button("SUNUCUYU TEST ET");
-                  test.setOnClickListener(
-                          v -> testServer());
-                  root.addView(test, buttonLp());
+                          copyButton,
+                          buttonLp());
 
                   TextView info =
                           text(
-                                  "Kod iki yoldan yakalanır: doğrudan gelen SMS veya Mesajlar bildirimi. Hangisi önce yakalarsa telefonda gösterilir.",
+                                  "Çalışma sırası: Masaüstü İş Turkcell girişini başlatır → SMS gelir → bu uygulama 6 haneli kodu onqam.com'a yollar → WordPress kodu masaüstüne verir → masaüstü kaldığı OTP adımından devam eder.",
                                   13,
                                   false,
-                                  Color.rgb(145, 156, 174));
+                                  Color.rgb(
+                                          145,
+                                          156,
+                                          174));
+
                   info.setPadding(
                           dp(8),
                           dp(18),
                           dp(8),
                           0);
-                  root.addView(info, matchWrap());
+
+                  root.addView(
+                          info,
+                          matchWrap());
 
                   return scroll;
+              }
+
+              private void saveAndConnect() {
+                  String key =
+                          apiKeyInput
+                                  .getText()
+                                  .toString()
+                                  .trim();
+
+                  if (!AppConfig.isValidApiKey(
+                          key)) {
+
+                      Toast.makeText(
+                              this,
+                              "API key 48 haneli HEX olmalıdır.",
+                              Toast.LENGTH_LONG)
+                              .show();
+
+                      return;
+                  }
+
+                  if (!AppConfig.saveApiKey(
+                          this,
+                          key)) {
+
+                      Toast.makeText(
+                              this,
+                              "API key kaydedilemedi.",
+                              Toast.LENGTH_LONG)
+                              .show();
+
+                      return;
+                  }
+
+                  testSavedConnection();
+              }
+
+              private void testSavedConnection() {
+                  String key =
+                          AppConfig.getApiKey(
+                                  this);
+
+                  if (!AppConfig.isValidApiKey(
+                          key)) {
+
+                      serverView.setText(
+                              "API key girilmedi");
+
+                      serverView.setTextColor(
+                              Color.rgb(
+                                      255,
+                                      178,
+                                      85));
+
+                      return;
+                  }
+
+                  serverView.setText(
+                          "Bağlantı test ediliyor…");
+
+                  new Thread(() -> {
+                      OtpApiClient.Result result =
+                              OtpApiClient.testConnection(
+                                      this,
+                                      key);
+
+                      runOnUiThread(() -> {
+                          serverView.setText(
+                                  result.ok
+                                          ? "Bağlandı ✓  "
+                                                  + result.message
+                                          : result.message);
+
+                          serverView.setTextColor(
+                                  result.ok
+                                          ? Color.rgb(
+                                                  89,
+                                                  219,
+                                                  143)
+                                          : Color.rgb(
+                                                  255,
+                                                  113,
+                                                  113));
+
+                          if (result.ok) {
+                              Toast.makeText(
+                                      this,
+                                      "API key doğru. onqam.com bağlantısı hazır.",
+                                      Toast.LENGTH_LONG)
+                                      .show();
+                          }
+                      });
+                  }, "VenasApiTest").start();
               }
 
               private void requestSmsPermission() {
@@ -759,6 +1682,7 @@ jobs:
                               "SMS izni zaten açık.",
                               Toast.LENGTH_SHORT)
                               .show();
+
                       return;
                   }
 
@@ -815,8 +1739,14 @@ jobs:
 
                   smsStatus.setTextColor(
                           smsEnabled
-                                  ? Color.rgb(89, 219, 143)
-                                  : Color.rgb(255, 178, 85));
+                                  ? Color.rgb(
+                                          89,
+                                          219,
+                                          143)
+                                  : Color.rgb(
+                                          255,
+                                          178,
+                                          85));
 
                   boolean listenerEnabled =
                           isListenerEnabled();
@@ -828,14 +1758,57 @@ jobs:
 
                   listenerStatus.setTextColor(
                           listenerEnabled
-                                  ? Color.rgb(89, 219, 143)
-                                  : Color.rgb(255, 178, 85));
+                                  ? Color.rgb(
+                                          89,
+                                          219,
+                                          143)
+                                  : Color.rgb(
+                                          255,
+                                          178,
+                                          85));
+
+                  String serverEvent =
+                          OtpStore.lastServerEvent(
+                                  this);
+
+                  long serverEventTs =
+                          OtpStore.lastServerEventTime(
+                                  this);
+
+                  if (serverEventTs > 0L) {
+                      String serverStamp =
+                              new SimpleDateFormat(
+                                      "HH:mm:ss",
+                                      Locale.getDefault())
+                                      .format(
+                                              new Date(
+                                                      serverEventTs));
+
+                      serverView.setText(
+                              serverStamp
+                                      + " • "
+                                      + serverEvent);
+
+                      serverView.setTextColor(
+                              OtpStore.lastServerOk(
+                                      this)
+                                      ? Color.rgb(
+                                              89,
+                                              219,
+                                              143)
+                                      : Color.rgb(
+                                              255,
+                                              113,
+                                              113));
+                  }
 
                   String lastEvent =
-                          OtpStore.lastEvent(this);
+                          OtpStore.lastEvent(
+                                  this);
 
                   long lastEventTs =
-                          OtpStore.lastEventTime(this);
+                          OtpStore.lastEventTime(
+                                  this);
 
                   if (lastEventTs > 0L) {
                       String stamp =
@@ -847,26 +1820,36 @@ jobs:
                                                       lastEventTs));
 
                       eventView.setText(
-                              stamp + " • " + lastEvent);
+                              stamp
+                                      + " • "
+                                      + lastEvent);
                   } else {
-                      eventView.setText(lastEvent);
+                      eventView.setText(
+                              lastEvent);
                   }
 
                   OtpStore.Entry entry =
-                          OtpStore.current(this);
+                          OtpStore.current(
+                                  this);
 
                   if (entry == null) {
                       visibleOtp = "";
-                      otpView.setText("------");
-                      refView.setText("Referans: —");
+                      otpView.setText(
+                              "------");
+                      refView.setText(
+                              "Referans: —");
                       timeView.setText(
                               "Yeni kod bekleniyor");
-                      copyButton.setEnabled(false);
+                      copyButton.setEnabled(
+                              false);
                       return;
                   }
 
-                  visibleOtp = entry.otp;
-                  otpView.setText(entry.otp);
+                  visibleOtp =
+                          entry.otp;
+
+                  otpView.setText(
+                          entry.otp);
 
                   refView.setText(
                           TextUtils.isEmpty(
@@ -892,9 +1875,11 @@ jobs:
                                           / 1000L));
 
                   String source =
-                          TextUtils.isEmpty(entry.source)
+                          TextUtils.isEmpty(
+                                  entry.source)
                                   ? ""
-                                  : " • " + entry.source;
+                                  : " • "
+                                          + entry.source;
 
                   timeView.setText(
                           "Algılandı: "
@@ -904,11 +1889,15 @@ jobs:
                                   + left
                                   + " sn sonra temizlenir");
 
-                  copyButton.setEnabled(true);
+                  copyButton.setEnabled(
+                          true);
               }
 
               private void copyOtp() {
-                  if (visibleOtp.length() != 6) return;
+                  if (visibleOtp.length()
+                          != 6) {
+                      return;
+                  }
 
                   ClipboardManager cm =
                           (ClipboardManager)
@@ -929,62 +1918,15 @@ jobs:
                           .show();
               }
 
-              private void testServer() {
-                  serverView.setText(
-                          "Test ediliyor…");
-
-                  new Thread(() -> {
-                      try {
-                          int code =
-                                  ServerStatusClient.check();
-
-                          runOnUiThread(() -> {
-                              if (code >= 200
-                                      && code < 300) {
-
-                                  serverView.setText(
-                                          "Erişilebilir ✓  HTTP "
-                                                  + code);
-
-                                  serverView.setTextColor(
-                                          Color.rgb(
-                                                  89,
-                                                  219,
-                                                  143));
-                              } else {
-                                  serverView.setText(
-                                          "Yanıt alındı: HTTP "
-                                                  + code);
-
-                                  serverView.setTextColor(
-                                          Color.rgb(
-                                                  255,
-                                                  178,
-                                                  85));
-                              }
-                          });
-                      } catch (Exception e) {
-                          runOnUiThread(() -> {
-                              serverView.setText(
-                                      "Bağlantı hatası");
-
-                              serverView.setTextColor(
-                                      Color.rgb(
-                                              255,
-                                              113,
-                                              113));
-                          });
-                      }
-                  }, "VenasStatusTest").start();
-              }
-
               private boolean isListenerEnabled() {
                   String enabled =
                           Settings.Secure.getString(
                                   getContentResolver(),
                                   "enabled_notification_listeners");
 
-                  if (enabled == null) return false;
+                  if (enabled == null) {
+                      return false;
+                  }
 
                   ComponentName me =
                           new ComponentName(
@@ -1014,7 +1956,10 @@ jobs:
                           dp(14));
 
                   box.setBackgroundColor(
-                          Color.rgb(18, 24, 34));
+                          Color.rgb(
+                                  18,
+                                  24,
+                                  34));
 
                   TextView labelView =
                           text(
@@ -1051,7 +1996,9 @@ jobs:
                           0,
                           dp(8));
 
-                  box.setLayoutParams(lp);
+                  box.setLayoutParams(
+                          lp);
+
                   return box;
               }
 
@@ -1064,9 +2011,14 @@ jobs:
                   TextView tv =
                           new TextView(this);
 
-                  tv.setText(value);
-                  tv.setTextSize(sp);
-                  tv.setTextColor(color);
+                  tv.setText(
+                          value);
+
+                  tv.setTextSize(
+                          sp);
+
+                  tv.setTextColor(
+                          color);
 
                   if (bold) {
                       tv.setTypeface(
@@ -1083,8 +2035,11 @@ jobs:
                   Button b =
                           new Button(this);
 
-                  b.setText(label);
-                  b.setTextSize(14);
+                  b.setText(
+                          label);
+
+                  b.setTextSize(
+                          14);
 
                   b.setTypeface(
                           Typeface.DEFAULT,
@@ -1100,7 +2055,9 @@ jobs:
                                           104,
                                           224)));
 
-                  b.setAllCaps(false);
+                  b.setAllCaps(
+                          false);
+
                   return b;
               }
 
@@ -1125,7 +2082,9 @@ jobs:
                           LinearLayout.LayoutParams.WRAP_CONTENT);
               }
 
-              private int dp(int value) {
+              private int dp(
+                      int value) {
+
                   return Math.round(
                           value
                                   * getResources()
@@ -1134,6 +2093,33 @@ jobs:
               }
           }
           JAVA
+
+          cat > settings.gradle <<'GRADLE'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+
+          rootProject.name = 'VenasHizliGiris'
+          include ':app'
+          GRADLE
+
+          cat > build.gradle <<'GRADLE'
+          plugins {
+              id 'com.android.application' version '8.9.0' apply false
+          }
+          GRADLE
 
           cat > app/build.gradle <<'GRADLE'
           plugins {
@@ -1148,8 +2134,8 @@ jobs:
                   applicationId 'com.venas.hizligiris.safe'
                   minSdk 26
                   targetSdk 35
-                  versionCode 14
-                  versionName '1.1.4'
+                  versionCode 15
+                  versionName '1.1.5'
               }
 
               buildTypes {
@@ -1175,11 +2161,11 @@ jobs:
         run: gradle :app:assembleDebug --stacktrace
 
       - name: APK adini duzelt
-        run: cp app/build/outputs/apk/debug/app-debug.apk VenasHizliGiris-v1.1.4.apk
+        run: cp app/build/outputs/apk/debug/app-debug.apk VenasHizliGiris-v1.1.5.apk
 
       - name: APK yi artifact olarak yukle
         uses: actions/upload-artifact@v4
         with:
-          name: VenasHizliGiris-v1.1.4-APK
-          path: VenasHizliGiris-v1.1.4.apk
+          name: VenasHizliGiris-v1.1.5-APK
+          path: VenasHizliGiris-v1.1.5.apk
           if-no-files-found: error
