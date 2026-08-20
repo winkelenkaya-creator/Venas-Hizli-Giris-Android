@@ -1,5 +1,4 @@
-
-name: Build Venas Hizli Giris APK v1.1.1
+name: Build Venas Hizli Giris APK v1.1.2
 
 on:
   push:
@@ -192,7 +191,7 @@ jobs:
                   append(out, extras.getCharSequence(Notification.EXTRA_TEXT));
                   append(out, extras.getCharSequence(Notification.EXTRA_BIG_TEXT));
                   append(out, extras.getCharSequence(Notification.EXTRA_SUB_TEXT));
-                  append(out, extras.getCharSequence(Notification.EXTRA_INFO));
+                  append(out, extras.getCharSequence(Notification.EXTRA_INFO_TEXT));
                   append(out, extras.getCharSequence(Notification.EXTRA_SUMMARY_TEXT));
 
                   CharSequence[] lines = extras.getCharSequenceArray(Notification.EXTRA_TEXT_LINES);
@@ -255,8 +254,8 @@ jobs:
                   applicationId 'com.venas.hizligiris.safe'
                   minSdk 26
                   targetSdk 35
-                  versionCode 12
-                  versionName '1.1.1'
+                  versionCode 13
+                  versionName '1.1.2'
               }
 
               buildTypes {
@@ -282,11 +281,11 @@ jobs:
         run: gradle :app:assembleDebug --stacktrace
 
       - name: APK adini duzelt
-        run: cp app/build/outputs/apk/debug/app-debug.apk VenasHizliGiris-v1.1.1.apk
+        run: cp app/build/outputs/apk/debug/app-debug.apk VenasHizliGiris-v1.1.2.apk
 
       - name: APK yi artifact olarak yukle
         uses: actions/upload-artifact@v4
         with:
-          name: VenasHizliGiris-v1.1.1-APK
-          path: VenasHizliGiris-v1.1.1.apk
+          name: VenasHizliGiris-v1.1.2-APK
+          path: VenasHizliGiris-v1.1.2.apk
           if-no-files-found: error
